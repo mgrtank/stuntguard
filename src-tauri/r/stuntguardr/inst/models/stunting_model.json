@@ -1,0 +1,54 @@
+{
+  "model_type": "logistic_regression",
+  "selected_features": ["Gender", "Age", "Birth_Weight", "Birth_Length", "Body_Weight"],
+  "numeric_columns": ["Age", "Birth_Weight", "Birth_Length", "Body_Weight"],
+  "feature_means": {
+    "Age": 13.6057,
+    "Birth_Weight": 2.7303,
+    "Birth_Length": 49.1564,
+    "Body_Weight": 7.531
+  },
+  "feature_sds": {
+    "Age": 7.4606,
+    "Birth_Weight": 0.3013,
+    "Birth_Length": 0.5135,
+    "Body_Weight": 1.7043
+  },
+  "coefficients": {
+    "(Intercept)": 0.3551,
+    "Gender": -0.4628,
+    "Age": 0.7417,
+    "Birth_Weight": 0.2434,
+    "Birth_Length": -0.4045,
+    "Body_Weight": 0.0927
+  },
+  "training_seed": 42,
+  "metrics": {
+    "train": {
+      "accuracy": 0.6541,
+      "precision": 0.8891,
+      "recall": 0.6534,
+      "f1": 0.7532,
+      "confusion": {
+        "tp": 3199,
+        "tn": 764,
+        "fp": 399,
+        "fn": 1697
+      }
+    },
+    "test": {
+      "accuracy": 0.6493,
+      "precision": 0.882,
+      "recall": 0.6536,
+      "f1": 0.7508,
+      "confusion": {
+        "tp": 800,
+        "tn": 183,
+        "fp": 107,
+        "fn": 424
+      }
+    }
+  },
+  "source_data": "Stunting_Dataset.csv",
+  "created_at": "2026-05-27 03:12:43.54289"
+}

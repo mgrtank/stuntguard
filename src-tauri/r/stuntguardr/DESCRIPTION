@@ -1,0 +1,14 @@
+Package: stuntguardr
+Type: Package
+Title: StuntGuard Stunting Risk Models
+Version: 0.1.0
+Authors@R: person(given = "Artur", family = "StuntGuard", role = c("aut", "cre"))
+Description: Training, export, and prediction helpers for stunting risk models used by the StuntGuard desktop app.
+License: MIT
+Encoding: UTF-8
+LazyData: true
+Imports:
+    dplyr,
+    jsonlite
+Suggests:
+    class
