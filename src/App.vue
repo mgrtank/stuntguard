@@ -1,5 +1,5 @@
 <script setup>
-import { computed, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 
 const views = [
@@ -11,80 +11,13 @@ const views = [
   { id: "care", label: "Intervention & Care Plan" },
 ];
 
-const defaultPatients = [
-  {
-    id: "P-1042",
-    name: "Amina K.",
-    ageMonths: 18,
-    risk: "Red",
-    hfaZ: -2.8,
-    followUp: "Due this week",
-    lastVisit: "2026-05-21",
-    drivers: ["Frequent diarrheal episodes", "Low birth weight", "Food insecurity"],
-    interventions: ["Micronutrient supplementation", "Caregiver counseling"],
-    timeline: [
-      "2026-05-21 Growth plateau detected",
-      "2026-05-13 Diarrheal episode",
-      "2026-05-01 Nutrition follow-up",
-    ],
-    medicalHistory: ["Chronic diarrhea", "Mild respiratory infection"],
-    caregiver: { name: "Mariam K.", phone: "+48 500 222 111" },
-    referralStatus: "Pending",
-    educationTopics: ["Protein intake", "Handwashing"],
-    growthSamples: [66.2, 67.1, 67.3, 67.2],
-    photos: [],
-  },
-  {
-    id: "P-1088",
-    name: "Noah M.",
-    ageMonths: 22,
-    risk: "Yellow",
-    hfaZ: -1.9,
-    followUp: "Next month",
-    lastVisit: "2026-05-12",
-    drivers: ["Prematurity", "Limited dietary diversity", "Household sanitation"],
-    interventions: ["Growth monitoring", "Feeding education"],
-    timeline: [
-      "2026-05-12 Vaccination review",
-      "2026-04-20 Follow-up consultation",
-      "2026-04-01 Intake visit",
-    ],
-    medicalHistory: ["Prematurity"],
-    caregiver: { name: "Anna M.", phone: "+48 500 333 444" },
-    referralStatus: "Not required",
-    educationTopics: ["Diet diversity"],
-    growthSamples: [69.0, 69.5, 70.1, 70.2],
-    photos: [],
-  },
-  {
-    id: "P-1105",
-    name: "Lina S.",
-    ageMonths: 14,
-    risk: "Green",
-    hfaZ: -0.7,
-    followUp: "Routine",
-    lastVisit: "2026-05-24",
-    drivers: ["No active clinical red flags", "Stable growth", "Breastfeeding maintained"],
-    interventions: ["Routine review"],
-    timeline: [
-      "2026-05-24 Routine review",
-      "2026-05-01 Immunization update",
-      "2026-04-10 Intake visit",
-    ],
-    medicalHistory: ["No significant infections"],
-    caregiver: { name: "Olga S.", phone: "+48 500 111 222" },
-    referralStatus: "Closed",
-    educationTopics: ["Complementary feeding"],
-    growthSamples: [63.0, 63.8, 64.4, 65.0],
-    photos: [],
-  },
-];
-
-const patients = ref([...defaultPatients]);
+const patients = ref([]);
 const currentView = ref("overview");
-const selectedPatientId = ref(defaultPatients[0].id);
+const selectedPatientId = ref("");
 const riskFilter = ref("All");
 const searchText = ref("");
+const dashboardSnapshot = ref(null);
+const dashboardMessage = ref("Loading dashboard from R...");
 
 const auth = reactive({
   storagePassphrase: "",
@@ -97,7 +30,10 @@ const authMessage = ref("Sign in to access the practitioner dashboard");
 const storageUnlocked = ref(false);
 const storageMessage = ref("Storage locked");
 
-const selectedPatient = computed(() => patients.value.find((patient) => patient.id === selectedPatientId.value) ?? null);
+const selectedPatient = computed(() => {
+  const patient = patients.value.find((entry) => entry.id === selectedPatientId.value);
+  return patient ? normalizePatient(patient) : null;
+});
 
 const patientForm = reactive({
   id: "",
@@ -121,6 +57,12 @@ const intakeForm = reactive({
 
 const zScoreResult = ref(null);
 const growthMessage = ref("Run calculation to update HFA Z-score");
+const assessmentBusy = ref(false);
+const assessmentStatus = ref("Assessment runs on save");
+let autosaveTimer = null;
+
+const selectedIntakeHistory = computed(() => selectedPatient.value?.intakeHistory ?? []);
+const selectedPredictionHistory = computed(() => selectedPatient.value?.predictionHistory ?? []);
 
 const predictionForm = reactive({
   gender: "Male",
@@ -153,6 +95,245 @@ const intervention = reactive({
 });
 
 const selectedPhotoPreview = ref("");
+
+function asText(value, fallback = "") {
+  return value === null || value === undefined ? fallback : String(value);
+}
+
+function asNumber(value, fallback = 0) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function cloneHistory(entries) {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+
+  return entries.map((entry) => {
+    if (entry && typeof entry === "object") {
+      return { ...entry };
+    }
+
+    return { label: String(entry) };
+  });
+}
+
+function latestHistoryEntry(entries) {
+  return Array.isArray(entries) && entries.length ? entries[entries.length - 1] : null;
+}
+
+function historyLabel(entry, fallbackLabel) {
+  if (!entry || typeof entry !== "object") {
+    return fallbackLabel;
+  }
+
+  const date = asText(entry.date);
+  const parts = [];
+
+  if (date) {
+    parts.push(date);
+  }
+
+  if (entry.zScore !== undefined) {
+    parts.push(`Z ${Number(entry.zScore).toFixed(2)}`);
+  }
+
+  if (entry.probability !== undefined) {
+    parts.push(`${Math.round(Number(entry.probability) * 100)}%`);
+  }
+
+  if (entry.predictedClass) {
+    parts.push(asText(entry.predictedClass));
+  }
+
+  if (entry.bodyLength !== undefined || entry.bodyWeight !== undefined) {
+    parts.push(
+      [entry.bodyLength !== undefined ? `${asNumber(entry.bodyLength).toFixed(1)} cm` : null, entry.bodyWeight !== undefined ? `${asNumber(entry.bodyWeight).toFixed(1)} kg` : null]
+        .filter(Boolean)
+        .join(" | ")
+    );
+  }
+
+  return parts.filter(Boolean).join(" - ") || fallbackLabel;
+}
+
+function normalizePatient(patient = {}) {
+  const intakeProfile = patient.intakeProfile && typeof patient.intakeProfile === "object" ? patient.intakeProfile : {};
+  const predictionProfile = patient.predictionProfile && typeof patient.predictionProfile === "object" ? patient.predictionProfile : {};
+
+  return {
+    ...patient,
+    id: asText(patient.id),
+    name: asText(patient.name),
+    ageMonths: asNumber(patient.ageMonths, 0),
+    risk: asText(patient.risk, "Pending assessment"),
+    hfaZ: Number.isFinite(Number(patient.hfaZ)) ? Number(patient.hfaZ) : "",
+    followUp: asText(patient.followUp, "Pending assessment"),
+    lastVisit: asText(patient.lastVisit, new Date().toISOString().slice(0, 10)),
+    drivers: Array.isArray(patient.drivers) ? patient.drivers.map((entry) => asText(entry)) : [],
+    interventions: Array.isArray(patient.interventions) ? patient.interventions.map((entry) => asText(entry)) : [],
+    timeline: Array.isArray(patient.timeline) ? patient.timeline.map((entry) => asText(entry)) : [],
+    medicalHistory: Array.isArray(patient.medicalHistory) ? patient.medicalHistory.map((entry) => asText(entry)) : [],
+    caregiver: {
+      name: asText(patient.caregiver?.name),
+      phone: asText(patient.caregiver?.phone),
+    },
+    referralStatus: asText(patient.referralStatus, "Pending"),
+    educationTopics: Array.isArray(patient.educationTopics) ? patient.educationTopics.map((entry) => asText(entry)) : [],
+    growthSamples: Array.isArray(patient.growthSamples)
+      ? patient.growthSamples.map((entry) => Number(entry)).filter((entry) => Number.isFinite(entry))
+      : [],
+    photos: Array.isArray(patient.photos) ? patient.photos.map((entry) => asText(entry)) : [],
+    bodyWeight: asNumber(patient.bodyWeight, asNumber(intakeProfile.bodyWeight, 10)),
+    bodyLength: asNumber(patient.bodyLength, asNumber(intakeProfile.bodyLength, 70)),
+    headCircumference: asNumber(patient.headCircumference, asNumber(intakeProfile.headCircumference, 46)),
+    gender: asText(patient.gender, asText(predictionProfile.gender, "Male")),
+    intakeProfile: {
+      gender: asText(intakeProfile.gender, asText(patient.gender, "Male")),
+      ageMonths: asNumber(intakeProfile.ageMonths, asNumber(patient.ageMonths, 0)),
+      bodyWeight: asNumber(intakeProfile.bodyWeight, asNumber(patient.bodyWeight, 10)),
+      bodyLength: asNumber(intakeProfile.bodyLength, asNumber(patient.bodyLength, 70)),
+      headCircumference: asNumber(intakeProfile.headCircumference, asNumber(patient.headCircumference, 46)),
+    },
+    predictionProfile: {
+      gender: asText(predictionProfile.gender, asText(patient.gender, "Male")),
+      age: asNumber(predictionProfile.age, asNumber(patient.ageMonths, 0)),
+      birthWeight: asNumber(predictionProfile.birthWeight, 3.0),
+      birthLength: asNumber(predictionProfile.birthLength, 49),
+      bodyWeight: asNumber(predictionProfile.bodyWeight, asNumber(patient.bodyWeight, 10)),
+      maternalHeight: asNumber(predictionProfile.maternalHeight, 160),
+      maternalBmi: asNumber(predictionProfile.maternalBmi, 23),
+      pregnancyComplications: Boolean(predictionProfile.pregnancyComplications),
+      gestationalAge: asNumber(predictionProfile.gestationalAge, 38),
+      cleanWater: predictionProfile.cleanWater !== undefined ? Boolean(predictionProfile.cleanWater) : true,
+      sanitation: predictionProfile.sanitation !== undefined ? Boolean(predictionProfile.sanitation) : true,
+      householdIncome: asText(predictionProfile.householdIncome, "Medium"),
+      exclusiveBreastfeeding: Boolean(predictionProfile.exclusiveBreastfeeding),
+      dietaryDiversity: asText(predictionProfile.dietaryDiversity, "Low"),
+    },
+    intakeHistory: cloneHistory(patient.intakeHistory),
+    predictionHistory: cloneHistory(patient.predictionHistory),
+  };
+}
+
+function syncFormsFromPatient(patient) {
+  const normalized = normalizePatient(patient);
+
+  patientForm.id = normalized.id;
+  patientForm.name = normalized.name;
+  patientForm.ageMonths = String(normalized.ageMonths);
+  patientForm.risk = normalized.risk;
+  patientForm.hfaZ = String(normalized.hfaZ);
+  patientForm.followUp = normalized.followUp;
+  patientForm.lastVisit = normalized.lastVisit;
+  patientForm.driversText = normalized.drivers.join("\n");
+  patientForm.interventionsText = normalized.interventions.join("\n");
+
+  const intakeSource = latestHistoryEntry(normalized.intakeHistory) ?? normalized.intakeProfile;
+  intakeForm.gender = asText(intakeSource.gender, normalized.gender || "Male");
+  intakeForm.ageMonths = asNumber(intakeSource.ageMonths, normalized.ageMonths);
+  intakeForm.bodyWeight = asNumber(intakeSource.bodyWeight, normalized.bodyWeight);
+  intakeForm.bodyLength = asNumber(intakeSource.bodyLength, normalized.bodyLength);
+  intakeForm.headCircumference = asNumber(intakeSource.headCircumference, normalized.headCircumference);
+
+  const predictionSource = latestHistoryEntry(normalized.predictionHistory) ?? normalized.predictionProfile;
+  predictionForm.gender = asText(predictionSource.gender, normalized.gender || "Male");
+  predictionForm.age = asNumber(predictionSource.age, normalized.ageMonths);
+  predictionForm.birthWeight = asNumber(predictionSource.birthWeight, predictionForm.birthWeight);
+  predictionForm.birthLength = asNumber(predictionSource.birthLength, predictionForm.birthLength);
+  predictionForm.bodyWeight = asNumber(predictionSource.bodyWeight, normalized.bodyWeight);
+  predictionForm.maternalHeight = asNumber(predictionSource.maternalHeight, predictionForm.maternalHeight);
+  predictionForm.maternalBmi = asNumber(predictionSource.maternalBmi, predictionForm.maternalBmi);
+  predictionForm.pregnancyComplications = Boolean(predictionSource.pregnancyComplications);
+  predictionForm.gestationalAge = asNumber(predictionSource.gestationalAge, predictionForm.gestationalAge);
+  predictionForm.cleanWater = predictionSource.cleanWater !== undefined ? Boolean(predictionSource.cleanWater) : predictionForm.cleanWater;
+  predictionForm.sanitation = predictionSource.sanitation !== undefined ? Boolean(predictionSource.sanitation) : predictionForm.sanitation;
+  predictionForm.householdIncome = asText(predictionSource.householdIncome, predictionForm.householdIncome);
+  predictionForm.exclusiveBreastfeeding = Boolean(predictionSource.exclusiveBreastfeeding);
+  predictionForm.dietaryDiversity = asText(predictionSource.dietaryDiversity, predictionForm.dietaryDiversity);
+
+  return normalized;
+}
+
+function normalizePatientsList(list) {
+  return Array.isArray(list) ? list.map((patient) => normalizePatient(patient)) : [];
+}
+
+function selectedPatientIndex() {
+  return patients.value.findIndex((patient) => patient.id === selectedPatientId.value);
+}
+
+function selectedPatientDraftFromForms() {
+  const current = selectedPatient.value;
+  if (!current) {
+    return null;
+  }
+
+  return normalizePatient({
+    ...current,
+    bodyWeight: Number(intakeForm.bodyWeight) || current.bodyWeight,
+    bodyLength: Number(intakeForm.bodyLength) || current.bodyLength,
+    headCircumference: Number(intakeForm.headCircumference) || current.headCircumference,
+    gender: predictionForm.gender,
+    intakeProfile: {
+      gender: intakeForm.gender,
+      ageMonths: Number(intakeForm.ageMonths) || 0,
+      bodyWeight: Number(intakeForm.bodyWeight) || 0,
+      bodyLength: Number(intakeForm.bodyLength) || 0,
+      headCircumference: Number(intakeForm.headCircumference) || 0,
+    },
+    predictionProfile: { ...predictionForm, age: Number(predictionForm.age) || 0 },
+  });
+}
+
+async function persistSelectedPatientDraft(options = {}) {
+  const idx = selectedPatientIndex();
+  if (idx < 0) {
+    return;
+  }
+
+  const existing = normalizePatient(patients.value[idx]);
+  const draft = selectedPatientDraftFromForms();
+  if (!draft) {
+    return;
+  }
+
+  const merged = normalizePatient({
+    ...existing,
+    ...draft,
+    drivers: existing.drivers,
+    interventions: existing.interventions,
+    timeline: existing.timeline,
+    medicalHistory: existing.medicalHistory,
+    caregiver: existing.caregiver,
+    referralStatus: existing.referralStatus,
+    educationTopics: existing.educationTopics,
+    growthSamples: existing.growthSamples,
+    photos: existing.photos,
+    intakeHistory: existing.intakeHistory,
+    predictionHistory: existing.predictionHistory,
+  });
+
+  patients.value[idx] = merged;
+
+  if (options.save !== false) {
+    await savePatientsToStore();
+  }
+}
+
+function scheduleSelectedPatientAutosave() {
+  if (!selectedPatient.value) {
+    return;
+  }
+
+  window.clearTimeout(autosaveTimer);
+  autosaveTimer = window.setTimeout(() => {
+    persistSelectedPatientDraft().catch((error) => {
+      storageMessage.value = `Auto-save failed: ${String(error)}`;
+    });
+  }, 500);
+}
 
 function startNewPatientEntry() {
   resetPatientForm();
@@ -200,26 +381,14 @@ function updateDraftAssessment({ zScore, probability } = {}) {
 }
 
 function splitLines(value) {
-  return value
+  return String(value ?? "")
     .split(/\n|,/)
     .map((item) => item.trim())
     .filter(Boolean);
 }
 
 function patientToForm(patient) {
-  patientForm.id = patient.id;
-  patientForm.name = patient.name;
-  patientForm.ageMonths = String(patient.ageMonths);
-  patientForm.risk = patient.risk;
-  patientForm.hfaZ = String(patient.hfaZ);
-  patientForm.followUp = patient.followUp;
-  patientForm.lastVisit = patient.lastVisit;
-  patientForm.driversText = patient.drivers.join("\n");
-  patientForm.interventionsText = patient.interventions.join("\n");
-
-  intakeForm.ageMonths = patient.ageMonths;
-  intakeForm.bodyWeight = Number(patient.bodyWeight ?? 10);
-  intakeForm.bodyLength = Number(patient.bodyLength ?? 70);
+  syncFormsFromPatient(patient);
 }
 
 function resetPatientForm() {
@@ -243,7 +412,7 @@ function nextPatientId() {
 }
 
 function upsertPatient() {
-  const id = patientForm.id.trim() || nextPatientId();
+  const id = String(patientForm.id ?? "").trim() || nextPatientId();
   const existing = patients.value.find((patient) => patient.id === id);
 
   if (patientForm.risk === "Pending assessment" || !String(patientForm.hfaZ).trim()) {
@@ -251,10 +420,11 @@ function upsertPatient() {
     return;
   }
 
-  const payload = {
-    ...(existing ?? {}),
+  const normalizedExisting = existing ? normalizePatient(existing) : null;
+  const payload = normalizePatient({
+    ...(normalizedExisting ?? {}),
     id,
-    name: patientForm.name.trim(),
+    name: String(patientForm.name ?? "").trim(),
     ageMonths: Number(patientForm.ageMonths) || 0,
     risk: patientForm.risk,
     hfaZ: Number(patientForm.hfaZ) || 0,
@@ -265,14 +435,49 @@ function upsertPatient() {
     bodyWeight: Number(intakeForm.bodyWeight) || 0,
     bodyLength: Number(intakeForm.bodyLength) || 0,
     headCircumference: Number(intakeForm.headCircumference) || 0,
-    timeline: existing?.timeline ?? [],
-    medicalHistory: existing?.medicalHistory ?? [],
-    caregiver: existing?.caregiver ?? { name: "", phone: "" },
+    gender: predictionForm.gender,
+    intakeProfile: {
+      gender: intakeForm.gender,
+      ageMonths: Number(intakeForm.ageMonths) || 0,
+      bodyWeight: Number(intakeForm.bodyWeight) || 0,
+      bodyLength: Number(intakeForm.bodyLength) || 0,
+      headCircumference: Number(intakeForm.headCircumference) || 0,
+    },
+    predictionProfile: { ...predictionForm, age: Number(predictionForm.age) || 0 },
+    timeline: normalizedExisting?.timeline ?? [],
+    medicalHistory: normalizedExisting?.medicalHistory ?? [],
+    caregiver: normalizedExisting?.caregiver ?? { name: "", phone: "" },
     referralStatus: intervention.referralStatus,
-    educationTopics: existing?.educationTopics ?? [],
-    growthSamples: existing?.growthSamples ?? [],
-    photos: existing?.photos ?? [],
-  };
+    educationTopics: normalizedExisting?.educationTopics ?? [],
+    growthSamples: normalizedExisting?.growthSamples ?? [],
+    photos: normalizedExisting?.photos ?? [],
+    intakeHistory: [
+      ...(normalizedExisting?.intakeHistory ?? []),
+      {
+        date: patientForm.lastVisit,
+        gender: intakeForm.gender,
+        ageMonths: Number(intakeForm.ageMonths) || 0,
+        bodyWeight: Number(intakeForm.bodyWeight) || 0,
+        bodyLength: Number(intakeForm.bodyLength) || 0,
+        headCircumference: Number(intakeForm.headCircumference) || 0,
+        zScore: zScoreResult.value?.z_score ?? null,
+      },
+    ],
+    predictionHistory: [
+      ...(normalizedExisting?.predictionHistory ?? []),
+      ...(predictionResult.value
+        ? [
+            {
+              date: new Date().toISOString().slice(0, 10),
+              ...predictionForm,
+              age: Number(predictionForm.age) || 0,
+              probability: predictionResult.value.probability,
+              predictedClass: predictionResult.value.predicted_class,
+            },
+          ]
+        : []),
+    ],
+  });
 
   if (!payload.name) {
     alert("Patient name is required");
@@ -288,6 +493,55 @@ function upsertPatient() {
 
   selectedPatientId.value = id;
   patientToForm(payload);
+  refreshDashboardSnapshot({ patients: patients.value, selectedPatientId: id }).catch(() => {});
+}
+
+async function assessNewPatientDraft() {
+  const [zResult, prediction] = await Promise.all([
+    invoke("calculate_hfa_z", {
+      ageMonths: Number(intakeForm.ageMonths),
+      lengthCm: Number(intakeForm.bodyLength),
+      gender: intakeForm.gender,
+    }),
+    invoke("predict_stunting", {
+      inputJson: JSON.stringify({
+        Gender: predictionForm.gender,
+        Age: Number(predictionForm.age),
+        "Birth Weight": Number(predictionForm.birthWeight),
+        "Birth Length": Number(predictionForm.birthLength),
+        "Body Weight": Number(predictionForm.bodyWeight),
+      }),
+    }),
+  ]);
+
+  zScoreResult.value = zResult;
+  predictionResult.value = prediction;
+  growthMessage.value = `${zResult.category} (Z=${zResult.z_score})`;
+  predictionStatus.value = `${prediction.predicted_class} (${Math.round(prediction.probability * 100)}%)`;
+  updateDraftAssessment({ zScore: zResult.z_score, probability: prediction.probability });
+
+  if (prediction.top_risk_drivers?.length) {
+    patientForm.driversText = prediction.top_risk_drivers.join("\n");
+  }
+
+  return { zResult, prediction };
+}
+
+async function saveNewPatientWithAssessment() {
+  assessmentBusy.value = true;
+  assessmentStatus.value = "Running assessment...";
+
+  try {
+    await assessNewPatientDraft();
+    assessmentStatus.value = "Assessment complete, saving patient...";
+    upsertPatient();
+    assessmentStatus.value = "Assessment saved with patient record";
+  } catch (e) {
+    assessmentStatus.value = `Assessment failed: ${String(e)}`;
+    alert(assessmentStatus.value);
+  } finally {
+    assessmentBusy.value = false;
+  }
 }
 
 function deletePatient(patientId) {
@@ -304,11 +558,51 @@ function deletePatient(patientId) {
       resetPatientForm();
     }
   }
+
+  refreshDashboardSnapshot({ patients: patients.value, selectedPatientId: selectedPatientId.value }).catch(() => {});
 }
 
 function selectPatient(patient) {
-  selectedPatientId.value = patient.id;
-  patientToForm(patient);
+  const normalized = syncFormsFromPatient(patient);
+  selectedPatientId.value = normalized.id;
+  refreshDashboardSnapshot({ selectedPatientId: normalized.id }).catch(() => {});
+}
+
+async function refreshDashboardSnapshot(overrides = {}) {
+  const request = {
+    selectedPatientId: overrides.selectedPatientId ?? selectedPatientId.value,
+    riskFilter: overrides.riskFilter ?? riskFilter.value,
+    searchText: overrides.searchText ?? searchText.value,
+  };
+
+  const sourcePatients = overrides.patients ?? patients.value;
+  if (Array.isArray(sourcePatients) && sourcePatients.length > 0) {
+    request.patients = sourcePatients;
+  }
+
+  try {
+    const snapshot = await invoke("dashboard_snapshot", {
+      requestJson: JSON.stringify(request),
+    });
+
+    dashboardSnapshot.value = snapshot;
+    patients.value = normalizePatientsList(snapshot.patients ?? []);
+    selectedPatientId.value = asText(snapshot.selectedPatientId, patients.value[0]?.id ?? "");
+
+    if (snapshot.selectedPatient) {
+      patientToForm(snapshot.selectedPatient);
+    } else if (patients.value[0]) {
+      patientToForm(patients.value[0]);
+    } else {
+      resetPatientForm();
+    }
+
+    dashboardMessage.value = `Dashboard loaded from R (${patients.value.length} patients)`;
+    return snapshot;
+  } catch (e) {
+    dashboardMessage.value = `Dashboard refresh failed: ${String(e)}`;
+    throw e;
+  }
 }
 
 const filteredPatients = computed(() => {
@@ -324,19 +618,15 @@ const filteredPatients = computed(() => {
 });
 
 const metrics = computed(() => {
-  const total = patients.value.length;
-  const highRisk = patients.value.filter((patient) => patient.risk === "Red").length;
-  const due = patients.value.filter((patient) => patient.followUp === "Due this week" || patient.followUp === "Overdue").length;
-
-  return {
-    total,
-    highRiskPct: total ? Math.round((highRisk / total) * 100) : 0,
-    due,
+  return dashboardSnapshot.value?.metrics ?? {
+    total: patients.value.length,
+    highRiskPct: patients.value.length ? Math.round((patients.value.filter((patient) => patient.risk === "Red").length / patients.value.length) * 100) : 0,
+    due: patients.value.filter((patient) => patient.followUp === "Due this week" || patient.followUp === "Overdue").length,
   };
 });
 
 const urgentAlerts = computed(() => {
-  return patients.value
+  return dashboardSnapshot.value?.urgentAlerts ?? patients.value
     .filter((patient) => patient.risk === "Red" || patient.followUp === "Overdue" || patient.hfaZ <= -2.8)
     .map((patient) => ({
       id: patient.id,
@@ -346,6 +636,10 @@ const urgentAlerts = computed(() => {
 });
 
 const growthChartPoints = computed(() => {
+  if (dashboardSnapshot.value?.growthChartPoints) {
+    return dashboardSnapshot.value.growthChartPoints;
+  }
+
   const samples = selectedPatient.value?.growthSamples ?? [64, 65, 66, 67];
   const minY = Math.min(...samples);
   const maxY = Math.max(...samples);
@@ -378,6 +672,7 @@ async function authenticate() {
     authenticated.value = true;
     authMessage.value = "Authenticated";
     currentView.value = "overview";
+    await loadPatientsFromStore();
   } catch (e) {
     authMessage.value = `Auth failed: ${String(e)}`;
   }
@@ -386,18 +681,23 @@ async function authenticate() {
 function logout() {
   authenticated.value = false;
   storageUnlocked.value = false;
+  auth.storagePassphrase = "";
   authMessage.value = "Signed out";
 }
 
 async function loadPatientsFromStore() {
   try {
     const res = await invoke("load_patients");
-    const parsed = JSON.parse(res);
-    patients.value = parsed;
-    if (patients.value[0]) {
-      selectPatient(patients.value[0]);
+    const parsed = normalizePatientsList(JSON.parse(res));
+    if (parsed.length > 0) {
+      patients.value = parsed;
+      await refreshDashboardSnapshot({ patients: parsed, selectedPatientId: parsed[0]?.id ?? "" });
+      storageMessage.value = `Loaded ${patients.value.length} patients`;
+      return;
     }
-    storageMessage.value = `Loaded ${patients.value.length} patients`;
+
+    await refreshDashboardSnapshot();
+    storageMessage.value = `Loaded default patients (${patients.value.length})`;
   } catch (e) {
     storageMessage.value = `Load failed: ${String(e)}`;
     alert(storageMessage.value);
@@ -406,8 +706,9 @@ async function loadPatientsFromStore() {
 
 async function savePatientsToStore() {
   try {
-    await invoke("save_patients", { patientsJson: JSON.stringify(patients.value) });
+    await invoke("save_patients", { patientsJson: JSON.stringify(normalizePatientsList(patients.value)) });
     storageMessage.value = `Saved ${patients.value.length} patients`;
+    await refreshDashboardSnapshot({ patients: patients.value, selectedPatientId: selectedPatientId.value }).catch(() => {});
   } catch (e) {
     storageMessage.value = `Save failed: ${String(e)}`;
     alert(storageMessage.value);
@@ -426,15 +727,49 @@ async function calculateZScore() {
     growthMessage.value = `${result.category} (Z=${result.z_score})`;
     updateDraftAssessment({ zScore: result.z_score, probability: predictionResult.value?.probability });
 
-    if (currentView.value === "profile" && selectedPatient.value) {
-      selectedPatient.value.hfaZ = Number(result.z_score);
-      selectedPatient.value.risk = result.z_score < -3 ? "Red" : result.z_score < -2 ? "Yellow" : "Green";
-      selectedPatient.value.growthSamples = [...(selectedPatient.value.growthSamples ?? []), Number(intakeForm.bodyLength)].slice(-8);
-      patientForm.hfaZ = String(result.z_score);
+    if (selectedPatient.value) {
+      const updatedPatient = normalizePatient({
+        ...selectedPatient.value,
+        hfaZ: Number(result.z_score),
+        risk: result.z_score < -3 ? "Red" : result.z_score < -2 ? "Yellow" : "Green",
+        growthSamples: [...(selectedPatient.value.growthSamples ?? []), Number(intakeForm.bodyLength)].slice(-8),
+        intakeProfile: {
+          gender: intakeForm.gender,
+          ageMonths: Number(intakeForm.ageMonths) || 0,
+          bodyWeight: Number(intakeForm.bodyWeight) || 0,
+          bodyLength: Number(intakeForm.bodyLength) || 0,
+          headCircumference: Number(intakeForm.headCircumference) || 0,
+        },
+        intakeHistory: [
+          ...(selectedPatient.value.intakeHistory ?? []),
+          {
+            date: new Date().toISOString().slice(0, 10),
+            gender: intakeForm.gender,
+            ageMonths: Number(intakeForm.ageMonths) || 0,
+            bodyWeight: Number(intakeForm.bodyWeight) || 0,
+            bodyLength: Number(intakeForm.bodyLength) || 0,
+            headCircumference: Number(intakeForm.headCircumference) || 0,
+            zScore: Number(result.z_score),
+          },
+        ],
+      });
+
+      const idx = patients.value.findIndex((patient) => patient.id === updatedPatient.id);
+      if (idx >= 0) {
+        patients.value[idx] = updatedPatient;
+      }
+
+      patientToForm(updatedPatient);
     }
   } catch (e) {
     growthMessage.value = `Z-score failed: ${String(e)}`;
     alert(growthMessage.value);
+    return;
+  }
+
+  if (selectedPatient.value) {
+    await savePatientsToStore();
+    await refreshDashboardSnapshot({ patients: patients.value, selectedPatientId: selectedPatientId.value }).catch(() => {});
   }
 }
 
@@ -460,8 +795,29 @@ async function runPrediction() {
       patientForm.driversText = result.top_risk_drivers.join("\n");
     }
 
-    if (currentView.value === "profile" && selectedPatient.value) {
-      selectedPatient.value.drivers = result.top_risk_drivers?.length ? result.top_risk_drivers : selectedPatient.value.drivers;
+    if (selectedPatient.value) {
+      const updatedPatient = normalizePatient({
+        ...selectedPatient.value,
+        drivers: result.top_risk_drivers?.length ? result.top_risk_drivers : selectedPatient.value.drivers,
+        predictionProfile: { ...predictionForm, age: Number(predictionForm.age) || 0 },
+        predictionHistory: [
+          ...(selectedPatient.value.predictionHistory ?? []),
+          {
+            date: new Date().toISOString().slice(0, 10),
+            ...predictionForm,
+            age: Number(predictionForm.age) || 0,
+            probability: result.probability,
+            predictedClass: result.predicted_class,
+          },
+        ],
+      });
+
+      const idx = patients.value.findIndex((patient) => patient.id === updatedPatient.id);
+      if (idx >= 0) {
+        patients.value[idx] = updatedPatient;
+      }
+
+      patientToForm(updatedPatient);
     }
   } catch (e) {
     predictionResult.value = null;
@@ -469,6 +825,11 @@ async function runPrediction() {
     alert(predictionStatus.value);
   } finally {
     predictionBusy.value = false;
+  }
+
+  if (selectedPatient.value) {
+    await savePatientsToStore();
+    await refreshDashboardSnapshot({ patients: patients.value, selectedPatientId: selectedPatientId.value }).catch(() => {});
   }
 }
 
@@ -487,9 +848,14 @@ function handlePhotoUpload(event) {
   reader.readAsDataURL(file);
 }
 
-if (patients.value[0]) {
-  patientToForm(patients.value[0]);
-}
+onMounted(() => {
+  refreshDashboardSnapshot().catch((error) => {
+    dashboardMessage.value = `Dashboard load failed: ${String(error)}`;
+    if (patients.value[0]) {
+      patientToForm(patients.value[0]);
+    }
+  });
+});
 </script>
 
 <template>
@@ -536,10 +902,16 @@ if (patients.value[0]) {
           </button>
         </nav>
         <div class="sidebar-actions">
+          <div v-if="selectedPatient" class="selected-patient-banner">
+            <span>Selected patient</span>
+            <strong>{{ selectedPatient.name }}</strong>
+            <small>{{ selectedPatient.id }} | {{ selectedPatient.risk }}</small>
+          </div>
           <button type="button" class="secondary" @click="loadPatientsFromStore">Load</button>
           <button type="button" class="secondary" @click="savePatientsToStore">Save</button>
           <button type="button" class="danger" @click="logout">Logout</button>
           <small class="status-line">{{ storageMessage }}</small>
+          <small class="status-line">{{ dashboardMessage }}</small>
         </div>
       </aside>
 
@@ -664,10 +1036,11 @@ if (patients.value[0]) {
             </div>
 
             <div class="action-row top-gap">
-              <button type="button" @click="upsertPatient">Save new patient</button>
+              <button type="button" @click="saveNewPatientWithAssessment" :disabled="assessmentBusy">{{ assessmentBusy ? 'Assessing...' : 'Assess & save patient' }}</button>
               <button type="button" class="secondary" @click="startNewPatientEntry">Fresh entry</button>
               <button type="button" class="secondary" @click="currentView = 'profile'">Go to profile</button>
             </div>
+            <small class="status-line">{{ assessmentStatus }}</small>
           </article>
 
           <article class="panel">
@@ -692,7 +1065,7 @@ if (patients.value[0]) {
         </section>
 
         <section v-if="currentView === 'intake'" class="view-grid">
-          <article class="panel">
+          <article class="panel" @input="scheduleSelectedPatientAutosave" @change="scheduleSelectedPatientAutosave">
             <h2>Anthropometric Intake</h2>
             <div class="form-grid">
               <label><span>Gender</span><select id="intake-gender" name="intake-gender" v-model="intakeForm.gender"><option>Male</option><option>Female</option></select></label>
@@ -705,6 +1078,20 @@ if (patients.value[0]) {
               <button type="button" @click="calculateZScore">Calculate HFA Z-score (R)</button>
             </div>
             <small class="status-line">{{ growthMessage }}</small>
+          </article>
+
+          <article class="panel">
+            <h2>Selected Patient History</h2>
+            <div v-if="selectedPatient" class="history-panel">
+              <small class="status-line">Last intake entries for {{ selectedPatient.name }}</small>
+              <ul class="simple-list compact-list">
+                <li v-for="(entry, index) in selectedIntakeHistory.slice(-3).reverse()" :key="`intake-${index}`">
+                  {{ historyLabel(entry, 'No intake history recorded') }}
+                </li>
+                <li v-if="selectedIntakeHistory.length === 0">No intake history recorded yet.</li>
+              </ul>
+            </div>
+            <p v-else class="status-line">Select a patient to review intake history.</p>
           </article>
 
           <article class="panel">
@@ -730,7 +1117,7 @@ if (patients.value[0]) {
         </section>
 
         <section v-if="currentView === 'prediction'" class="view-grid">
-          <article class="panel">
+          <article class="panel" @input="scheduleSelectedPatientAutosave" @change="scheduleSelectedPatientAutosave">
             <h2>Risk Factors Checklist</h2>
             <div class="form-grid">
               <label><span>Maternal Height (cm)</span><input id="pred-mh" name="pred-mh" v-model="predictionForm.maternalHeight" type="number" /></label>
@@ -751,6 +1138,20 @@ if (patients.value[0]) {
             <div class="action-row top-gap">
               <button type="button" @click="runPrediction" :disabled="predictionBusy">{{ predictionBusy ? 'Predicting...' : 'Run R Prediction' }}</button>
             </div>
+          </article>
+
+          <article class="panel">
+            <h2>Selected Patient History</h2>
+            <div v-if="selectedPatient" class="history-panel">
+              <small class="status-line">Recent prediction runs for {{ selectedPatient.name }}</small>
+              <ul class="simple-list compact-list">
+                <li v-for="(entry, index) in selectedPredictionHistory.slice(-3).reverse()" :key="`prediction-${index}`">
+                  {{ historyLabel(entry, 'No prediction history recorded') }}
+                </li>
+                <li v-if="selectedPredictionHistory.length === 0">No prediction history recorded yet.</li>
+              </ul>
+            </div>
+            <p v-else class="status-line">Select a patient to review prediction history.</p>
           </article>
 
           <article class="panel">
@@ -936,6 +1337,30 @@ if (patients.value[0]) {
   gap: 8px;
 }
 
+.selected-patient-banner {
+  display: grid;
+  gap: 3px;
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  background: rgba(56, 189, 248, 0.1);
+}
+
+.selected-patient-banner span {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: #84d6ff;
+}
+
+.selected-patient-banner strong {
+  font-size: 1rem;
+}
+
+.selected-patient-banner small {
+  color: rgba(226, 234, 246, 0.8);
+}
+
 .view-pane {
   padding: 24px;
   display: grid;
@@ -1082,6 +1507,18 @@ button.danger {
   margin: 0;
   padding-left: 18px;
   line-height: 1.6;
+}
+
+.compact-list {
+  margin-top: 8px;
+  font-size: 0.92rem;
+}
+
+.history-panel {
+  border-radius: 14px;
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  background: rgba(255, 255, 255, 0.03);
 }
 
 .patient-list {

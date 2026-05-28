@@ -10,6 +10,7 @@ use rand::RngCore;
 use sha2::Sha256;
 use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 static KEYSTORE: Lazy<Mutex<Option<Vec<u8>>>> = Lazy::new(|| Mutex::new(None));
 
@@ -44,6 +45,10 @@ fn prediction_script_path() -> PathBuf {
 
 fn zscore_script_path() -> PathBuf {
     package_root().join("inst").join("scripts").join("calculate_hfa_z.R")
+}
+
+fn dashboard_state_script_path() -> PathBuf {
+    package_root().join("inst").join("scripts").join("dashboard_state.R")
 }
 
 fn find_rscript() -> Result<PathBuf, String> {
@@ -102,6 +107,42 @@ fn decrypt_with_key(key: &[u8], nonce: &[u8], ct: &[u8]) -> Result<Vec<u8>, Stri
         .decrypt(Nonce::from_slice(nonce), ct)
         .map_err(|e| e.to_string())?;
     Ok(pt)
+}
+
+fn run_r_json_script(script_path: PathBuf, request_json: &str) -> Result<String, String> {
+    let rscript = find_rscript()?;
+
+    if !script_path.exists() {
+        return Err(format!("R script not found: {}", script_path.display()));
+    }
+
+    let temp_dir = std::env::temp_dir();
+    let unique_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    let request_path = temp_dir.join(format!("stg-request-{}-{}.json", std::process::id(), unique_id));
+    fs::write(&request_path, request_json).map_err(|e| e.to_string())?;
+
+    let output = Command::new(rscript)
+        .arg("--vanilla")
+        .arg(script_path)
+        .arg(&request_path)
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    let _ = fs::remove_file(&request_path);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        return Err(if stderr.trim().is_empty() {
+            format!("R script failed with status {}", output.status)
+        } else {
+            stderr
+        });
+    }
+
+    String::from_utf8(output.stdout).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -218,6 +259,13 @@ fn load_patients() -> Result<String, String> {
 }
 
 #[tauri::command]
+fn dashboard_snapshot(request_json: String) -> Result<Value, String> {
+    let stdout = run_r_json_script(dashboard_state_script_path(), &request_json)?;
+    let parsed: Value = serde_json::from_str(&stdout).map_err(|e| e.to_string())?;
+    Ok(parsed)
+}
+
+#[tauri::command]
 fn predict_stunting(input_json: &str) -> Result<PredictionResponse, String> {
     let rscript = find_rscript()?;
     let script_path = prediction_script_path();
@@ -311,6 +359,7 @@ pub fn run() {
             unlock_storage,
             save_patients,
             load_patients,
+            dashboard_snapshot,
             predict_stunting,
             calculate_hfa_z
         ])
